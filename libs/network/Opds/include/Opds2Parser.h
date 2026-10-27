@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "OpdsEntry.h"
+#include "OpdsRowBudget.h"
 
 /**
  * Streaming parser for OPDS 2.0 JSON catalog feeds (application/opds+json).
@@ -124,9 +125,17 @@ class Opds2Parser final : public Print {
 
   Scope scopeForChild(Scope parent, bool isObject) const;
   Scope current() const { return depth > 0 ? stack[depth - 1] : Scope::FEED; }
+  // True inside a publication object (any depth below its PUB scope).
+  bool inPublication() const {
+    for (uint8_t i = 0; i < depth; ++i) {
+      if (stack[i] == Scope::PUB) return true;
+    }
+    return false;
+  }
 
   void resetLink();
   void commitFeedLink();
+  void keepFeedLink(std::string& target);  // first link of a kind, charged to the budget
   void commitPubLink();
   void commitNavLink();
   void commitGroupLink();
@@ -146,6 +155,9 @@ class Opds2Parser final : public Print {
   bool sawRoot = false;
   bool errorOccured = false;
   bool feedTruncated = false;
+  bool entriesStopped = false;  // see OpdsRowBudget::append()
+  bool collectPublication = true;  // false: the current publication is skipped, not built
+  bool facetsStopped = false;
 
   char pendingKey[24] = {0};
 
@@ -158,7 +170,7 @@ class Opds2Parser final : public Print {
   bool pendingKeyIsPreferred() const;
 
   std::vector<OpdsEntry> entries;
-  size_t entryLimit = 0;  // set by reserveFeedEntries()
+  OpdsRowBudget budget;
   std::vector<OpdsEntry> facetEntries;
   OpdsEntry currentEntry;
 

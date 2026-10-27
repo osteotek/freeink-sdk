@@ -77,8 +77,7 @@ inline int opdsAcquisitionRank(const char* rel) {
 
 // Shared memory bounds for both feed parsers.
 namespace OpdsLimits {
-constexpr size_t ENTRY_STORAGE_CAPACITY = 64;
-constexpr size_t MAX_ENTRIES = ENTRY_STORAGE_CAPACITY - 2;
+constexpr size_t MAX_ENTRIES = 62;
 constexpr size_t MAX_TITLE_CHARS = 160;
 constexpr size_t MAX_AUTHOR_CHARS = 120;
 constexpr size_t MAX_ID_CHARS = 128;
@@ -86,18 +85,9 @@ constexpr size_t MAX_HREF_CHARS = 768;
 constexpr size_t MAX_SEARCH_TEMPLATE_CHARS = 768;
 constexpr size_t MAX_PAGE_URL_CHARS = 768;
 constexpr size_t MAX_FACET_ENTRIES = 24;
-// Per-entry description cap: enough for the detail page's visible lines while
-// bounding worst-case feed RAM (MAX_ENTRIES * this).
-constexpr size_t MAX_DESCRIPTION_CHARS = 500;
-
-// A parser is created once the response is flowing, when TLS has split the heap.
-// These size a vector to the largest free block instead of reserving the full
-// capacity, which aborts when it does not fit. Callers stop appending at
-// capacity(), so parsing never reallocates.
-//
-// Reserves up to ENTRY_STORAGE_CAPACITY entries and returns the entry limit,
-// keeping the MAX_ENTRIES margin; 0 when not even a few rows fit.
-size_t reserveFeedEntries(std::vector<OpdsEntry>& entries);
-// Reserves up to MAX_FACET_ENTRIES facet rows (possibly none).
-void reserveFacetEntries(std::vector<OpdsEntry>& facets);
+// Per-entry description cap. A feed holds many entries at once, and the
+// description is most of an entry's heap, so a short one lets more entries fit.
+// OPDS 1.x detail pages show only this text; pages that fetch a publication
+// document show its full description instead.
+constexpr size_t MAX_DESCRIPTION_CHARS = 200;
 }  // namespace OpdsLimits

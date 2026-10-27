@@ -20,8 +20,10 @@ static_assert(MAX_HREF_CHARS < StreamingJsonParser::TOKEN_BUF_SIZE - 1 &&
 Opds2Parser::Opds2Parser()
     : parser(JsonCallbacks{this, &sOnKey, &sOnString, &sOnNumber, &sOnBool, nullptr, &sOnObjectStart, &sOnObjectEnd,
                            &sOnArrayStart, &sOnArrayEnd}) {
-  entryLimit = reserveFeedEntries(entries);
-  if (entryLimit == 0) errorOccured = true;
+  if (!budget.start() || !budget.reserveFirst(entries, OpdsRowBudget::MIN_FIRST_ROWS, MAX_ENTRIES)) {
+    LOG_ERR("OPDS", "OOM: no heap for feed entries");
+    errorOccured = true;
+  }
 }
 
 void Opds2Parser::setPreferredLanguage(const char* lang) {
@@ -225,14 +227,14 @@ void Opds2Parser::beginGroup() {
 void Opds2Parser::endGroup() {
   // Field order in the group object is not guaranteed, so the heading and the
   // "see all" entry are applied only once the whole group has been read.
-  if (!groupSelfHref.empty() && entries.size() < entryLimit) {
+  if (!groupSelfHref.empty()) {
     OpdsEntry seeAll;
     seeAll.type = OpdsEntryType::NAVIGATION;
     seeAll.id = OPDS_SEE_ALL_ID;
     seeAll.href = std::move(groupSelfHref);
-    entries.push_back(std::move(seeAll));
+    if (!budget.append(entries, MAX_ENTRIES, entriesStopped, std::move(seeAll))) feedTruncated = true;
   }
-  if (!groupTitle.empty() && entries.size() > groupStartIndex) {
+  if (!groupTitle.empty() && entries.size() > groupStartIndex && budget.tryCharge(groupTitle)) {
     entries[groupStartIndex].heading = std::move(groupTitle);
   }
   groupTitle.clear();
@@ -263,6 +265,10 @@ void Opds2Parser::onContainerStart(const bool isObject) {
       currentEntry = OpdsEntry{};
       pubAcqRank = -1;
       pubHasPlainEpub = false;
+      if (!OpdsRowBudget::heapAboveFloor()) entriesStopped = true;
+      // Once rows stop, the rest of the feed's publications are not built.
+      collectPublication = !entriesStopped && entries.size() < MAX_ENTRIES;
+      if (!collectPublication) feedTruncated = true;
       break;
     case Scope::GROUP:
       beginGroup();
@@ -309,7 +315,7 @@ void Opds2Parser::onContainerEnd() {
       endGroup();
       break;
     case Scope::FACET:
-      if (!facetTitle.empty() && facetEntries.size() > facetStartIndex) {
+      if (!facetTitle.empty() && facetEntries.size() > facetStartIndex && budget.tryCharge(facetTitle)) {
         facetEntries[facetStartIndex].heading = std::move(facetTitle);
       }
       facetTitle.clear();
@@ -320,6 +326,7 @@ void Opds2Parser::onContainerEnd() {
 }
 
 void Opds2Parser::onStringValue(const char* value, const size_t len) {
+  if (!collectPublication && inPublication()) return;
   switch (current()) {
     case Scope::FEED_LINK:
     case Scope::NAV_LINK:
@@ -345,16 +352,21 @@ void Opds2Parser::onStringValue(const char* value, const size_t len) {
       applyRel(value);
       break;
     case Scope::FEED_META:
-      if (strcmp(pendingKey, "title") == 0) assignBounded(feedTitle, value, len, MAX_TITLE_CHARS);
+      if (strcmp(pendingKey, "title") == 0) {
+        assignBounded(feedTitle, value, len, MAX_TITLE_CHARS);
+        budget.charge(feedTitle);
+      }
       break;
     case Scope::FEED_TITLE:
       // Localized feed title object: prefer the UI language's translation,
       // otherwise keep the first one seen.
       if (pendingKeyIsPreferred()) {
         assignBounded(feedTitle, value, len, MAX_TITLE_CHARS);
+        budget.charge(feedTitle);
         localizedTitleLocked = true;
       } else if (!localizedTitleLocked && feedTitle.empty()) {
         assignBounded(feedTitle, value, len, MAX_TITLE_CHARS);
+        budget.charge(feedTitle);
       }
       break;
     case Scope::GROUP_META:
@@ -438,34 +450,39 @@ void Opds2Parser::onNumberValue(const char* value) {
 void Opds2Parser::commitFeedLink() {
   if (link.href.empty()) return;
   if (link.relSearch && (link.templated || link.href.find('{') != std::string::npos)) {
-    if (searchTemplate.empty() && link.href.size() <= MAX_SEARCH_TEMPLATE_CHARS) searchTemplate = link.href;
+    if (link.href.size() <= MAX_SEARCH_TEMPLATE_CHARS) keepFeedLink(searchTemplate);
     return;
   }
-  if (link.relNext && nextPageUrl.empty()) nextPageUrl = link.href;
-  if (link.relPrev && prevPageUrl.empty()) prevPageUrl = link.href;
-  if (link.relFirst && firstPageUrl.empty()) firstPageUrl = link.href;
-  if (link.relLast && lastPageUrl.empty()) lastPageUrl = link.href;
-  if (link.relShelf && shelfUrl.empty()) shelfUrl = link.href;
-  if (link.relWishlist && wishlistUrl.empty()) wishlistUrl = link.href;
-  if (link.relHistory && historyUrl.empty()) historyUrl = link.href;
+  if (link.relNext) keepFeedLink(nextPageUrl);
+  if (link.relPrev) keepFeedLink(prevPageUrl);
+  if (link.relFirst) keepFeedLink(firstPageUrl);
+  if (link.relLast) keepFeedLink(lastPageUrl);
+  if (link.relShelf) keepFeedLink(shelfUrl);
+  if (link.relWishlist) keepFeedLink(wishlistUrl);
+  if (link.relHistory) keepFeedLink(historyUrl);
+}
+
+void Opds2Parser::keepFeedLink(std::string& target) {
+  if (!target.empty()) return;
+  target = link.href;
+  budget.charge(target);
 }
 
 void Opds2Parser::commitNavLink() {
   if (link.href.empty() || link.title.empty()) return;
-  if (entries.size() >= entryLimit) {
-    feedTruncated = true;
-    return;
-  }
   // The stack still holds ... FEED/GROUP > NAV at this point (NAV_LINK was
   // just popped); only top-level navigation participates in group dedup.
-  if (depth >= 2 && stack[depth - 2] == Scope::FEED) {
-    topNavIndices.push_back(static_cast<uint16_t>(entries.size()));
-  }
+  const bool topLevel = depth >= 2 && stack[depth - 2] == Scope::FEED;
+  const auto index = static_cast<uint16_t>(entries.size());
   OpdsEntry entry;
   entry.type = OpdsEntryType::NAVIGATION;
   entry.title = std::move(link.title);
   entry.href = std::move(link.href);
-  entries.push_back(std::move(entry));
+  if (!budget.append(entries, MAX_ENTRIES, entriesStopped, std::move(entry))) {
+    feedTruncated = true;
+    return;
+  }
+  if (topLevel) topNavIndices.push_back(index);
 }
 
 void Opds2Parser::commitGroupLink() {
@@ -473,12 +490,7 @@ void Opds2Parser::commitGroupLink() {
 }
 
 void Opds2Parser::commitFacetLink() {
-  if (link.href.empty() || link.title.empty()) return;
-  if (facetEntries.capacity() == 0) reserveFacetEntries(facetEntries);
-  if (facetEntries.size() >= facetEntries.capacity()) {
-    feedTruncated = true;
-    return;
-  }
+  if (link.href.empty() || link.title.empty() || facetsStopped) return;
   OpdsEntry entry;
   entry.type = OpdsEntryType::NAVIGATION;
   entry.title = std::move(link.title);
@@ -488,7 +500,9 @@ void Opds2Parser::commitFacetLink() {
     snprintf(buf, sizeof(buf), "%ld", static_cast<long>(link.numberOfItems));
     entry.detail = buf;
   }
-  facetEntries.push_back(std::move(entry));
+  if (!budget.append(facetEntries, MAX_FACET_ENTRIES, facetsStopped, std::move(entry), OpdsRowBudget::FACET_HEADROOM)) {
+    feedTruncated = true;
+  }
 }
 
 void Opds2Parser::commitPubLink() {
@@ -561,13 +575,9 @@ void Opds2Parser::commitPublication() {
   // preview: keep only the first MAX_GROUP_PREVIEW so a large group doesn't
   // starve the rest. Top-level (flat-feed) publications are not capped.
   if (depth >= 2 && stack[depth - 2] == Scope::GROUP && ++groupPubCount > MAX_GROUP_PREVIEW) return;
-  if (entries.size() >= entryLimit) {
-    feedTruncated = true;
-    return;
-  }
   currentEntry.type = OpdsEntryType::BOOK;
-  entries.push_back(std::move(currentEntry));
-  currentEntry = OpdsEntry{};
+  if (!budget.append(entries, MAX_ENTRIES, entriesStopped, std::move(currentEntry))) feedTruncated = true;
+  currentEntry = OpdsEntry{};  // also frees a dropped entry's strings
 }
 
 // ---- static callbacks ----

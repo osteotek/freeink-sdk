@@ -7,49 +7,29 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <utility>
 
 using namespace OpdsLimits;
 
-namespace {
-constexpr size_t STRING_HEADROOM_BYTES = 4096;  // left for the entries' own strings
-constexpr size_t MIN_ENTRY_CAPACITY = 8;
-
-size_t affordableEntries(const size_t cap) {
-  const size_t block = ESP.getMaxAllocHeap();
-  return std::min(cap, block > STRING_HEADROOM_BYTES ? (block - STRING_HEADROOM_BYTES) / sizeof(OpdsEntry) : 0);
-}
-}  // namespace
-
-size_t OpdsLimits::reserveFeedEntries(std::vector<OpdsEntry>& entries) {
-  const size_t capacity = affordableEntries(ENTRY_STORAGE_CAPACITY);
-  if (capacity < MIN_ENTRY_CAPACITY) {
-    LOG_ERR("OPDS", "OOM: room for %u feed entries", static_cast<unsigned>(capacity));
-    return 0;
-  }
-  entries.reserve(capacity);
-  return capacity - (ENTRY_STORAGE_CAPACITY - MAX_ENTRIES);
-}
-
-void OpdsLimits::reserveFacetEntries(std::vector<OpdsEntry>& facets) {
-  facets.reserve(affordableEntries(MAX_FACET_ENTRIES));
-}
-
 OpdsParser::OpdsParser() {
-  // Before expat: it allocates nothing large and fails without aborting.
-  entryLimit = reserveFeedEntries(entries);
-  if (entryLimit == 0) {
-    errorOccured = true;
-    return;
-  }
+  // expat, its first input buffer and the text buffer are set up before the
+  // budget is taken, so the budget sees the heap they hold.
   parser = XML_ParserCreate(nullptr);
-  if (!parser) {
+  if (!parser || !XML_GetBuffer(parser, WRITE_CHUNK_BYTES)) {
     errorOccured = true;
     LOG_DBG("OPDS", "Couldn't allocate memory for parser");
+    destroyXmlParser(parser);
     return;
   }
   XML_SetUserData(parser, this);
   XML_SetElementHandler(parser, startElement, endElement);
   XML_SetCharacterDataHandler(parser, characterData);
+  currentText.reserve(MAX_DESCRIPTION_CHARS + 1);
+  if (!budget.start() || !budget.reserveFirst(entries, OpdsRowBudget::MIN_FIRST_ROWS, MAX_ENTRIES)) {
+    LOG_ERR("OPDS", "OOM: no heap for feed entries (%u free)", static_cast<unsigned>(ESP.getFreeHeap()));
+    errorOccured = true;
+    destroyXmlParser(parser);
+  }
 }
 
 OpdsParser::~OpdsParser() { destroyXmlParser(parser); }
@@ -61,10 +41,8 @@ size_t OpdsParser::write(const uint8_t* xmlData, const size_t length) {
 
   const char* currentPos = reinterpret_cast<const char*>(xmlData);
   size_t remaining = length;
-  constexpr size_t chunkSize = 1024;
-
   while (remaining > 0) {
-    const size_t toRead = remaining < chunkSize ? remaining : chunkSize;
+    const size_t toRead = remaining < WRITE_CHUNK_BYTES ? remaining : WRITE_CHUNK_BYTES;
     void* const buf = XML_GetBuffer(parser, toRead);
     if (!buf) {
       errorOccured = true;
@@ -99,7 +77,7 @@ void OpdsParser::flush() {
 bool OpdsParser::error() const { return errorOccured; }
 
 void OpdsParser::clear() {
-  entries.clear();
+  std::vector<OpdsEntry>().swap(entries);
   searchTemplate.clear();
   searchDescriptionUrl.clear();
   nextPageUrl.clear();
@@ -113,7 +91,7 @@ void OpdsParser::clear() {
   inFeedTitle = false;
   entryAcqRank = -1;
   entryHasPlainEpub = false;
-  facetEntries.clear();
+  std::vector<OpdsEntry>().swap(facetEntries);
   lastFacetGroup.clear();
   inEntryLink = false;
   chosenLinkIsPurchase = false;
@@ -127,6 +105,8 @@ void OpdsParser::clear() {
   inSummary = summaryIsContent = descInMarkup = false;
   collectCurrentEntry = false;
   feedTruncated = false;
+  entriesStopped = facetsStopped = false;
+  if (!budget.start()) errorOccured = true;
 }
 
 std::vector<OpdsEntry> OpdsParser::getBooks() const {
@@ -162,6 +142,12 @@ void OpdsParser::assignBounded(std::string& target, const char* value, const siz
   target.assign(value, strnlen(value, maxLen));
 }
 
+void OpdsParser::keepFeedString(std::string& target, const char* value, const size_t maxLen) {
+  const size_t heldBefore = OpdsRowBudget::heldBy(target);
+  assignBounded(target, value, maxLen);
+  budget.chargeGrowth(target, heldBefore);
+}
+
 void OpdsParser::appendBounded(std::string& target, const char* value, const size_t len, const size_t maxLen) {
   if (target.size() >= maxLen) return;
   const size_t remaining = maxLen - target.size();
@@ -173,7 +159,8 @@ void XMLCALL OpdsParser::startElement(void* userData, const XML_Char* name, cons
 
   if (strcmp(name, "entry") == 0 || strstr(name, ":entry") != nullptr) {
     self->inEntry = true;
-    self->collectCurrentEntry = self->entries.size() < self->entryLimit;
+    if (!OpdsRowBudget::heapAboveFloor()) self->entriesStopped = true;
+    self->collectCurrentEntry = !self->entriesStopped && self->entries.size() < MAX_ENTRIES;
     self->feedTruncated = self->feedTruncated || !self->collectCurrentEntry;
     self->currentEntry = OpdsEntry{};
     self->currentText.clear();
@@ -205,31 +192,29 @@ void XMLCALL OpdsParser::startElement(void* userData, const XML_Char* name, cons
 
       if (rel && strcmp(rel, "search") == 0) {
         if (strstr(href, "{searchTerms}") != nullptr) {
-          assignBounded(self->searchTemplate, href, MAX_SEARCH_TEMPLATE_CHARS);
+          self->keepFeedString(self->searchTemplate, href, MAX_SEARCH_TEMPLATE_CHARS);
         } else {
           // No inline template: href points at an OpenSearch description
           // document (calibre-web, COPS, Kavita).
-          assignBounded(self->searchDescriptionUrl, href, MAX_SEARCH_TEMPLATE_CHARS);
+          self->keepFeedString(self->searchDescriptionUrl, href, MAX_SEARCH_TEMPLATE_CHARS);
         }
       } else if (rel && strcmp(rel, "next") == 0 && !self->inEntry) {
-        assignBounded(self->nextPageUrl, href, MAX_PAGE_URL_CHARS);
+        self->keepFeedString(self->nextPageUrl, href, MAX_PAGE_URL_CHARS);
       } else if (rel && (strcmp(rel, "previous") == 0 || strcmp(rel, "prev") == 0) && !self->inEntry) {
-        assignBounded(self->prevPageUrl, href, MAX_PAGE_URL_CHARS);
+        self->keepFeedString(self->prevPageUrl, href, MAX_PAGE_URL_CHARS);
       } else if (rel && strcmp(rel, "first") == 0 && !self->inEntry) {
-        assignBounded(self->firstPageUrl, href, MAX_PAGE_URL_CHARS);
+        self->keepFeedString(self->firstPageUrl, href, MAX_PAGE_URL_CHARS);
       } else if (rel && strcmp(rel, "last") == 0 && !self->inEntry) {
-        assignBounded(self->lastPageUrl, href, MAX_PAGE_URL_CHARS);
+        self->keepFeedString(self->lastPageUrl, href, MAX_PAGE_URL_CHARS);
       } else if (rel && strstr(rel, "opds-spec.org/shelf") != nullptr && !self->inEntry) {
-        assignBounded(self->shelfUrl, href, MAX_PAGE_URL_CHARS);
+        self->keepFeedString(self->shelfUrl, href, MAX_PAGE_URL_CHARS);
       } else if (rel && strstr(rel, "opds-spec.org/wishlist") != nullptr && !self->inEntry) {
-        assignBounded(self->wishlistUrl, href, MAX_PAGE_URL_CHARS);
+        self->keepFeedString(self->wishlistUrl, href, MAX_PAGE_URL_CHARS);
       } else if (rel && strstr(rel, "opds-spec.org/history") != nullptr && !self->inEntry) {
-        assignBounded(self->historyUrl, href, MAX_PAGE_URL_CHARS);
+        self->keepFeedString(self->historyUrl, href, MAX_PAGE_URL_CHARS);
       } else if (rel && strstr(rel, "opds-spec.org/facet") != nullptr && !self->inEntry) {
         const char* title = findAttribute(atts, "title");
-        if (self->facetEntries.capacity() == 0) reserveFacetEntries(self->facetEntries);
-        if (self->facetEntries.size() >= self->facetEntries.capacity()) self->feedTruncated = true;
-        if (title && title[0] != '\0' && self->facetEntries.size() < self->facetEntries.capacity()) {
+        if (title && title[0] != '\0' && !self->facetsStopped) {
           OpdsEntry facet;
           facet.type = OpdsEntryType::NAVIGATION;
           assignBounded(facet.title, title, MAX_TITLE_CHARS);
@@ -240,8 +225,12 @@ void XMLCALL OpdsParser::startElement(void* userData, const XML_Char* name, cons
           if (group && self->lastFacetGroup != group) {
             assignBounded(facet.heading, group, MAX_TITLE_CHARS);
             self->lastFacetGroup = group;
+            self->budget.charge(self->lastFacetGroup);
           }
-          self->facetEntries.push_back(std::move(facet));
+          if (!self->budget.append(self->facetEntries, MAX_FACET_ENTRIES, self->facetsStopped, std::move(facet),
+                                   OpdsRowBudget::FACET_HEADROOM)) {
+            self->feedTruncated = true;
+          }
         }
       }
 
@@ -337,13 +326,15 @@ void XMLCALL OpdsParser::endElement(void* userData, const XML_Char* name) {
   auto* self = static_cast<OpdsParser*>(userData);
 
   if (strcmp(name, "entry") == 0 || strstr(name, ":entry") != nullptr) {
-    if (self->collectCurrentEntry && !self->currentEntry.title.empty() && !self->currentEntry.href.empty()) {
-      self->entries.push_back(self->currentEntry);
+    if (self->collectCurrentEntry && !self->currentEntry.title.empty() && !self->currentEntry.href.empty() &&
+        !self->budget.append(self->entries, MAX_ENTRIES, self->entriesStopped, std::move(self->currentEntry))) {
+      self->feedTruncated = true;
     }
     self->inEntry = false;
     self->collectCurrentEntry = false;
   } else if (!self->inEntry && self->inFeedTitle && (strcmp(name, "title") == 0 || strstr(name, ":title") != nullptr)) {
     self->feedTitle = self->currentText;
+    self->budget.charge(self->feedTitle);
     self->inFeedTitle = false;
   } else if (!self->inEntry && self->osTarget) {
     *self->osTarget = static_cast<int32_t>(strtol(self->currentText.c_str(), nullptr, 10));

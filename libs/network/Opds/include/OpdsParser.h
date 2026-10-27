@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "OpdsEntry.h"
+#include "OpdsRowBudget.h"
 
 // Legacy alias for backward compatibility
 using OpdsBook = OpdsEntry;
@@ -106,11 +107,14 @@ class OpdsParser final : public Print {
   // Helper to find attribute value
   static const char* findAttribute(const XML_Char** atts, const char* name);
   static void assignBounded(std::string& target, const char* value, size_t maxLen);
+  // Feed-level link or template; any heap it grows into is charged to the budget.
+  void keepFeedString(std::string& target, const char* value, size_t maxLen);
   static void appendBounded(std::string& target, const char* value, size_t len, size_t maxLen);
 
   XML_Parser parser = nullptr;
   std::vector<OpdsEntry> entries;
-  size_t entryLimit = 0;  // set by reserveFeedEntries()
+  OpdsRowBudget budget;
+  static constexpr size_t WRITE_CHUNK_BYTES = 1024;  // expat input buffer per parse step
   std::vector<OpdsEntry> facetEntries;
   // facetGroup of the last collected facet link; a change starts a new
   // section heading.
@@ -153,4 +157,6 @@ class OpdsParser final : public Print {
 
   bool errorOccured = false;
   bool feedTruncated = false;
+  bool entriesStopped = false;  // see OpdsRowBudget::append()
+  bool facetsStopped = false;
 };

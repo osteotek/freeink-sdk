@@ -45,7 +45,11 @@ class OpdsTransport {
 
   // Streaming GET. `accept`/`acceptLanguage` are sent when non-null. When
   // `captureErrorBody` is set, a 401 body is also streamed to `onChunk` (OPDS
-  // authentication documents are served as 401 bodies).
+  // authentication documents are served as 401 bodies). Over TLS, lend the
+  // connection one full-record buffer for the response (SecureHttpClient::
+  // setReserveFullRecord): feeds are parsed while they stream, and the parsers'
+  // heap reserve (OpdsRowBudget::reserveFor) does not cover a fresh ~16 KB record
+  // buffer per record.
   virtual HttpResult get(const std::string& url, const HttpAuth& auth, const char* accept,
                          const char* acceptLanguage, bool captureErrorBody, const OpdsDataSink& onChunk) = 0;
 

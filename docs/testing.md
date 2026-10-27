@@ -77,6 +77,32 @@ report decode into key events, auto-reconnect, scanning and teardown order.
 The fake has no radio, so pairing, link timing and memory use still need a
 device.
 
+## OPDS feed parsing
+
+```sh
+sh libs/network/Opds/test/host/run.sh
+```
+
+Needs the expat library and headers (`-lexpat`; on Debian, `libexpat1-dev`).
+Compiles `OpdsFeedParser` with its Atom backend (over expat) and its OPDS 2.0
+JSON backend (over JsonSax) against an `operator new` that draws from a heap
+budget and throws past it, as an allocation failure aborts the firmware. It
+checks that:
+
+- a large feed on a tight heap keeps a gap-free prefix of its entries, reports
+  truncation, and reaches at most 4 KB into the parse reserve;
+- buffers held while each chunk after the first is parsed (standing in for
+  network receive buffers) change neither the result nor its safety;
+- small entries are kept past the row storage reserved up front;
+- facet rows listed before the entries leave budget for them;
+- a heap below the parse reserve fails the parse;
+- with ample heap, entries keep their title, author, link and description, and
+  stop at `MAX_ENTRIES`.
+
+The test heap counts only `operator new`, so it misses expat's own allocations.
+It also treats free heap as one block. Fragmentation, expat and TLS buffers
+still need a device.
+
 ## Display drivers
 
 ```sh
